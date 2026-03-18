@@ -6,13 +6,19 @@ from flask import Flask, render_template, request
 import os
 import uuid
 
+# ================================
+# App Config
+# ================================
+
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'static'
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB limit
 
-# Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 🔥 Force CPU + limit threads (important for Render)
+device = torch.device("cpu")
+torch.set_num_threads(1)
 
 # ================================
 # Model
@@ -61,12 +67,18 @@ class CNN(nn.Module):
         x = self.fc(x)
         return x
 
-# Load model
+# ================================
+# Load Model (only once)
+# ================================
+
 model = CNN().to(device)
-model.load_state_dict(torch.load("cat_dog_model.pth", map_location=device))
+model.load_state_dict(torch.load("cat_dog_model.pth", map_location="cpu"))
 model.eval()
 
+# ================================
 # Transform
+# ================================
+
 transform = tf.Compose([
     tf.Resize((128,128)),
     tf.ToTensor(),
@@ -87,15 +99,24 @@ def allowed_file(filename):
 # ================================
 
 def predict_image(image_path):
-    image = Image.open(image_path).convert("RGB")
-    image = transform(image).unsqueeze(0).to(device)
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
 
-    with torch.no_grad():
-        output = model(image)
-        probs = torch.softmax(output, dim=1)
-        conf, pred = torch.max(probs, 1)
+            # 🔥 reduce memory usage early
+            img.thumbnail((128, 128))
 
-    return classes[pred.item()], conf.item()
+            image = transform(img).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            output = model(image)
+            probs = torch.softmax(output, dim=1)
+            conf, pred = torch.max(probs, 1)
+
+        return classes[pred.item()], conf.item()
+
+    except Exception as e:
+        return "Error", 0.0
 
 # ================================
 # Routes
@@ -112,14 +133,19 @@ def index():
 
         if file and allowed_file(file.filename):
 
-            # Unique filename (no overwrite)
-            filename = str(uuid.uuid4()) + ".jpg"
+            filename = f"{uuid.uuid4()}.jpg"
             path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
 
-            file.save(path)
+            try:
+                file.save(path)
 
-            prediction, confidence = predict_image(path)
-            image_path = path
+                prediction, confidence = predict_image(path)
+                image_path = path
+
+            finally:
+                # 🧹 cleanup to prevent storage/memory issues
+                if os.path.exists(path):
+                    os.remove(path)
 
     return render_template(
         "index.html",
@@ -128,7 +154,10 @@ def index():
         image_path=image_path
     )
 
-# Run app
+# ================================
+# Entry (for local only)
+# ================================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
